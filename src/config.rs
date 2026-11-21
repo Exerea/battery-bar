@@ -1,10 +1,22 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs;
+use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use windows::core::PCWSTR;
+use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
 
 use crate::model::DeviceReading;
+
+fn to_wide_path(path: &std::path::Path) -> Vec<u16> {
+    OsStr::new(path).encode_wide().chain(std::iter::once(0)).collect()
+}
+
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -18,15 +30,17 @@ pub enum DisplayMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub display_mode: DisplayMode,
-    /// Global low-battery threshold (%) for LowOnly display and red/amber highlighting.
+    /// Global low-battery threshold (%) for LowOnly display and amber/red highlighting.
     pub low_threshold: u8,
     /// Poll interval in seconds.
     pub poll_interval_secs: u64,
+    /// Whether to show short device labels (e.g. "MX", "PRO", "スマホ") beside each icon.
+    #[serde(default = "default_true")]
+    pub show_labels: bool,
     /// Whether to still show a low device while it is actively charging.
     #[serde(default)]
     pub show_while_charging: bool,
     /// Explicit set of device keys selected for taskbar monitoring.
-    /// When `selection_initialized` is false, newly seen devices are auto-selected once.
     #[serde(default)]
     pub selected_keys: HashSet<String>,
     #[serde(default)]
@@ -45,6 +59,7 @@ impl Default for AppConfig {
             display_mode: DisplayMode::LowOnly,
             low_threshold: 30,
             poll_interval_secs: 60,
+            show_labels: true,
             show_while_charging: false,
             selected_keys: HashSet::new(),
             selection_initialized: false,
@@ -55,11 +70,15 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    pub fn config_path() -> PathBuf {
+    pub fn config_dir() -> PathBuf {
         let base = std::env::var_os("APPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
-        base.join("BatteryBar").join("config.json")
+        base.join("BatteryBar")
+    }
+
+    pub fn config_path() -> PathBuf {
+        Self::config_dir().join("config.json")
     }
 
     pub fn load() -> Self {
@@ -70,13 +89,37 @@ impl AppConfig {
         }
     }
 
+    /// Persist config atomically via a temporary file so power loss never leaves a truncated JSON.
     pub fn save(&self) -> Result<(), String> {
+        let dir = Self::config_dir();
+        fs::create_dir_all(&dir).map_err(|e| format!("create config dir failed: {e}"))?;
         let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("create config dir failed: {e}"))?;
-        }
+        let tmp_path = dir.join("config.json.tmp");
         let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        fs::write(&path, body).map_err(|e| format!("write config failed: {e}"))
+        fs::write(&tmp_path, body).map_err(|e| format!("write temp config failed: {e}"))?;
+        let src = to_wide_path(&tmp_path);
+        let dst = to_wide_path(&path);
+        let replaced = unsafe {
+            MoveFileExW(
+                PCWSTR(src.as_ptr()),
+                PCWSTR(dst.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING,
+            )
+        };
+        if let Err(e) = replaced {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("replace config failed: {e}"));
+        }
+        Ok(())
+    }
+
+    /// Delete all saved configuration files and remove %APPDATA%\BatteryBar cleanly on uninstall.
+    pub fn remove_all_data() -> Result<(), String> {
+        let dir = Self::config_dir();
+        if dir.exists() {
+            fs::remove_dir_all(&dir).map_err(|e| format!("remove config dir failed: {e}"))?;
+        }
+        Ok(())
     }
 
     /// On first run, select only currently connected devices so disconnected legacy BT pairings
@@ -142,7 +185,7 @@ mod tests {
 
     #[test]
     fn low_only_shows_only_selected_unplugged_low_devices() {
-        let mut cfg = AppConfig::default(); // LowOnly, threshold=30
+        let mut cfg = AppConfig::default();
         cfg.selected_keys.insert("a".to_string());
         cfg.selection_initialized = true;
 
@@ -163,5 +206,12 @@ mod tests {
 
         cfg.display_mode = DisplayMode::Always;
         assert!(cfg.should_show_on_taskbar(&sample("phone", 95, true, true)));
+    }
+
+    #[test]
+    fn default_shows_labels_for_non_technical_clarity() {
+        let cfg = AppConfig::default();
+        assert!(cfg.show_labels);
+        assert_eq!(cfg.low_threshold, 30);
     }
 }

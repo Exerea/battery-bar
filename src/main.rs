@@ -10,13 +10,12 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    GetLastError, ERROR_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
 };
 #[cfg(not(debug_assertions))]
 use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
@@ -27,18 +26,19 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowW, GetMessageW, KillTimer,
-    PostMessageW, PostQuitMessage, RegisterClassW, SetTimer, TranslateMessage, MSG, WM_APP,
-    WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
-    WINDOW_EX_STYLE, WINDOW_STYLE,
+    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetTimer,
+    TranslateMessage, MSG, WM_APP, WM_COMMAND, WM_DESTROY, WM_DEVICECHANGE, WM_LBUTTONUP,
+    WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WINDOW_EX_STYLE,
+    WINDOW_STYLE,
 };
 
 use crate::config::{AppConfig, DisplayMode};
 use crate::model::{DeviceKind, DeviceReading};
 use crate::ui::taskbar::{StripItem, TaskbarWidget};
 use crate::ui::tray::{
-    TrayIcon, DEVICE_CMD_STRIDE, ID_AUTOSTART, ID_DEVICE_BASE, ID_EXIT, ID_MODE_ALWAYS,
-    ID_MODE_LOW_ONLY, ID_OPEN_CONFIG, ID_REFRESH_NOW, ID_SHOW_CHARGING, ID_THRESHOLD_BASE,
-    THRESHOLDS,
+    confirm_uninstall, notify_uninstall_done, show_context_menu, TrayIcon, DEVICE_CMD_STRIDE,
+    ID_AUTOSTART, ID_DEVICE_BASE, ID_EXIT, ID_HIDE_CHARGING, ID_MODE_ALWAYS, ID_MODE_LOW_ONLY,
+    ID_REFRESH_NOW, ID_SHOW_LABELS, ID_THRESHOLD_BASE, ID_UNINSTALL_EXIT, THRESHOLDS,
 };
 
 const CONTROLLER_CLASS: &str = "BatteryBarHiddenController";
@@ -51,10 +51,16 @@ const WM_ACTIVATE_EXISTING: u32 = WM_APP + 5;
 
 const TIMER_POLL: usize = 1;
 const TIMER_REPOSITION: usize = 2;
+const TIMER_DEVICE_DEBOUNCE: usize = 3;
+
+const DBT_DEVNODES_CHANGED: usize = 0x0007;
+const PBT_APMRESUMESUSPEND: usize = 0x0007;
+const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
 const GRACE_MISS_LIMIT: u8 = 3;
 
 struct AppState {
     hwnd: HWND,
+    taskbar_created_msg: u32,
     cfg: AppConfig,
     devices: Vec<DeviceReading>,
     /// Tracks consecutive missed polls per device key so brief wireless sleep or HID contention
@@ -64,7 +70,9 @@ struct AppState {
     tray: TrayIcon,
     poll_rx: Option<Receiver<Vec<DeviceReading>>>,
     polling: bool,
+    menu_open: bool,
     startup_notified: bool,
+    was_first_run: bool,
 }
 
 thread_local! {
@@ -77,6 +85,10 @@ fn to_wide(s: &str) -> Vec<u16> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--uninstall") {
+        run_cli_uninstall();
+        return;
+    }
     if args.iter().any(|a| a == "--list" || a == "--json") {
         run_cli(&args);
         return;
@@ -88,13 +100,16 @@ fn main() {
         // Single-instance guard: if already running, ask the existing instance to open its menu
         // instead of exiting silently, so double-clicking the executable always responds visibly.
         let mutex_name = to_wide("Local\\BatteryBarSingleInstance");
-        let _mutex = CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr()));
+        let mutex = CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr())).ok();
         if GetLastError() == ERROR_ALREADY_EXISTS {
             let cls = to_wide(CONTROLLER_CLASS);
             if let Ok(existing) = FindWindowW(PCWSTR(cls.as_ptr()), PCWSTR::null()) {
                 if !existing.0.is_null() {
                     let _ = PostMessageW(existing, WM_ACTIVATE_EXISTING, WPARAM(0), LPARAM(0));
                 }
+            }
+            if let Some(h) = mutex {
+                let _ = CloseHandle(h);
             }
             return;
         }
@@ -110,6 +125,9 @@ fn main() {
         };
         let _ = RegisterClassW(&wc);
 
+        let tb_created_w = to_wide("TaskbarCreated");
+        let taskbar_created_msg = RegisterWindowMessageW(PCWSTR(tb_created_w.as_ptr()));
+
         let Ok(hwnd) = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             PCWSTR(cls.as_ptr()),
@@ -124,10 +142,15 @@ fn main() {
             inst,
             None,
         ) else {
+            if let Some(h) = mutex {
+                let _ = CloseHandle(h);
+            }
             return;
         };
 
+        startup::sync_path_if_enabled();
         let mut cfg = AppConfig::load();
+        let was_first_run = !cfg.selection_initialized;
         if args.iter().any(|a| a == "--always") {
             cfg.display_mode = DisplayMode::Always;
         }
@@ -139,6 +162,7 @@ fn main() {
         APP.with(|cell| {
             *cell.borrow_mut() = Some(AppState {
                 hwnd,
+                taskbar_created_msg,
                 cfg,
                 devices: Vec::new(),
                 missed_polls: HashMap::new(),
@@ -146,7 +170,9 @@ fn main() {
                 tray,
                 poll_rx: None,
                 polling: false,
+                menu_open: false,
                 startup_notified: false,
+                was_first_run,
             });
         });
 
@@ -162,9 +188,25 @@ fn main() {
 
         let _ = KillTimer(hwnd, TIMER_POLL);
         let _ = KillTimer(hwnd, TIMER_REPOSITION);
+        let _ = KillTimer(hwnd, TIMER_DEVICE_DEBOUNCE);
         APP.with(|cell| {
             *cell.borrow_mut() = None;
         });
+        if let Some(h) = mutex {
+            let _ = CloseHandle(h);
+        }
+    }
+}
+
+fn run_cli_uninstall() {
+    #[cfg(not(debug_assertions))]
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+    startup::remove_startup_entry();
+    match AppConfig::remove_all_data() {
+        Ok(()) => println!("Removed startup entry and saved settings. You can now delete battery-bar.exe."),
+        Err(e) => eprintln!("Cleanup warning: {e}"),
     }
 }
 
@@ -209,7 +251,9 @@ fn run_cli(args: &[String]) {
 
 fn trigger_async_poll() {
     APP.with(|cell| {
-        let mut guard = cell.borrow_mut();
+        let Ok(mut guard) = cell.try_borrow_mut() else {
+            return;
+        };
         let Some(state) = guard.as_mut() else {
             return;
         };
@@ -248,8 +292,12 @@ fn apply_ui_refresh(state: &mut AppState) {
             let pct = d.percent?;
             let th = state.cfg.effective_threshold(&d.key);
             let short_label = if let Some(custom) = state.cfg.custom_labels.get(&d.key) {
-                custom.clone()
-            } else if kind_counts.get(&d.kind).copied().unwrap_or(0) > 1 {
+                if state.cfg.show_labels {
+                    custom.clone()
+                } else {
+                    String::new()
+                }
+            } else if state.cfg.show_labels || kind_counts.get(&d.kind).copied().unwrap_or(0) > 1 {
                 short_name_hint(&d.name)
             } else {
                 String::new()
@@ -285,7 +333,7 @@ fn apply_ui_refresh(state: &mut AppState) {
         }
     }
     let tip = if tip_parts.is_empty() {
-        format!("BatteryBar（{}%以下で警告）", state.cfg.low_threshold)
+        format!("BatteryBar（{}%以下で表示）", state.cfg.low_threshold)
     } else {
         tip_parts.join(" / ")
     };
@@ -300,12 +348,27 @@ fn apply_ui_refresh(state: &mut AppState) {
             .iter()
             .filter(|d| state.cfg.selected_keys.contains(&d.key))
             .count();
-        let body = format!(
-            "監視中 {} 件 / 警告中 {} 件（トレイアイコンから機器と閾値を変更）",
-            selected_count,
-            visible.len()
-        );
+        let body = if visible.is_empty() {
+            format!(
+                "見守り中 {}台（すべて残量十分）。右下のトレイアイコンから機器や表示残量を変更できます。",
+                selected_count
+            )
+        } else {
+            format!(
+                "見守り中 {}台 / 低下表示 {}台。右下のトレイアイコンから設定を変更できます。",
+                selected_count,
+                visible.len()
+            )
+        };
         state.tray.notify_silent("BatteryBar を開始しました", &body);
+
+        // On true first launch with no low devices visible yet, open the menu once so first-time
+        // users immediately see the detected devices and understand where controls live.
+        if state.was_first_run && visible.is_empty() {
+            unsafe {
+                let _ = PostMessageW(state.hwnd, WM_ACTIVATE_EXISTING, WPARAM(0), LPARAM(0));
+            }
+        }
     }
 }
 
@@ -326,6 +389,12 @@ fn short_name_hint(name: &str) -> String {
     if lower.contains("iphone") {
         return "iPhone".to_string();
     }
+    if name.contains("スマホ") {
+        return "スマホ".to_string();
+    }
+    if name.contains("PC バッテリー") {
+        return "PC".to_string();
+    }
     name.split_whitespace()
         .next()
         .unwrap_or(name)
@@ -336,6 +405,8 @@ fn short_name_hint(name: &str) -> String {
 
 fn handle_command(cmd_id: usize) {
     let mut need_poll = false;
+    let mut ask_uninstall_hwnd: Option<HWND> = None;
+
     APP.with(|cell| {
         let mut guard = cell.borrow_mut();
         let Some(state) = guard.as_mut() else {
@@ -353,7 +424,12 @@ fn handle_command(cmd_id: usize) {
                 let _ = state.cfg.save();
                 apply_ui_refresh(state);
             }
-            ID_SHOW_CHARGING => {
+            ID_SHOW_LABELS => {
+                state.cfg.show_labels = !state.cfg.show_labels;
+                let _ = state.cfg.save();
+                apply_ui_refresh(state);
+            }
+            ID_HIDE_CHARGING => {
                 state.cfg.show_while_charging = !state.cfg.show_while_charging;
                 let _ = state.cfg.save();
                 apply_ui_refresh(state);
@@ -365,10 +441,8 @@ fn handle_command(cmd_id: usize) {
                 let next = !startup::is_enabled();
                 let _ = startup::set_enabled(next);
             }
-            ID_OPEN_CONFIG => {
-                let _ = state.cfg.save();
-                let path = AppConfig::config_path();
-                let _ = Command::new("notepad.exe").arg(path).spawn();
+            ID_UNINSTALL_EXIT => {
+                ask_uninstall_hwnd = Some(state.hwnd);
             }
             ID_EXIT => unsafe {
                 PostQuitMessage(0);
@@ -408,8 +482,54 @@ fn handle_command(cmd_id: usize) {
         }
     });
 
+    // Prompt outside RefCell borrow because MessageBoxW runs a nested Win32 message loop.
+    if let Some(hwnd) = ask_uninstall_hwnd {
+        if confirm_uninstall(hwnd) {
+            startup::remove_startup_entry();
+            let _ = AppConfig::remove_all_data();
+            notify_uninstall_done(hwnd);
+            unsafe {
+                PostQuitMessage(0);
+            }
+        }
+        return;
+    }
+
     if need_poll {
         trigger_async_poll();
+    }
+}
+
+/// Snapshot menu state, release APP borrow, run TrackPopupMenu, then dispatch the chosen command.
+fn open_menu_safely() {
+    let snapshot = APP.with(|cell| {
+        let Ok(mut guard) = cell.try_borrow_mut() else {
+            return None;
+        };
+        let state = guard.as_mut()?;
+        if state.menu_open {
+            return None;
+        }
+        state.menu_open = true;
+        Some((state.hwnd, state.cfg.clone(), state.devices.clone()))
+    });
+
+    let Some((hwnd, cfg, devices)) = snapshot else {
+        return;
+    };
+
+    let cmd_id = show_context_menu(hwnd, &cfg, &devices, startup::is_enabled());
+
+    APP.with(|cell| {
+        if let Ok(mut guard) = cell.try_borrow_mut() {
+            if let Some(state) = guard.as_mut() {
+                state.menu_open = false;
+            }
+        }
+    });
+
+    if cmd_id != 0 {
+        handle_command(cmd_id);
     }
 }
 
@@ -454,34 +574,81 @@ unsafe extern "system" fn main_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Handle dynamic Explorer restart message ("TaskbarCreated") before fixed WM_* match.
+    let is_taskbar_created = APP.with(|cell| {
+        cell.try_borrow()
+            .ok()
+            .and_then(|g| {
+                g.as_ref()
+                    .map(|s| s.taskbar_created_msg != 0 && msg == s.taskbar_created_msg)
+            })
+            .unwrap_or(false)
+    });
+    if is_taskbar_created {
+        APP.with(|cell| {
+            if let Ok(mut guard) = cell.try_borrow_mut() {
+                if let Some(state) = guard.as_mut() {
+                    state.tray.re_add();
+                    state.widget.recreate_and_reposition();
+                }
+            }
+        });
+        return LRESULT(0);
+    }
+
     match msg {
         WM_TIMER => {
             match wparam.0 {
                 TIMER_POLL => trigger_async_poll(),
                 TIMER_REPOSITION => {
                     APP.with(|cell| {
-                        if let Some(state) = cell.borrow_mut().as_mut() {
-                            state.widget.ensure_alive_and_reposition();
+                        if let Ok(mut guard) = cell.try_borrow_mut() {
+                            if let Some(state) = guard.as_mut() {
+                                state.widget.ensure_alive_and_reposition();
+                            }
                         }
                     });
+                }
+                TIMER_DEVICE_DEBOUNCE => {
+                    let _ = KillTimer(hwnd, TIMER_DEVICE_DEBOUNCE);
+                    trigger_async_poll();
                 }
                 _ => {}
             }
             LRESULT(0)
         }
+        WM_DEVICECHANGE => {
+            // Debounce USB/Bluetooth arrival or removal events so plugging in a charger or
+            // turning on a headset updates within ~2 seconds without polling storms.
+            if wparam.0 == DBT_DEVNODES_CHANGED {
+                let _ = SetTimer(hwnd, TIMER_DEVICE_DEBOUNCE, 2000, None);
+            }
+            LRESULT(0)
+        }
+        WM_POWERBROADCAST => {
+            if wparam.0 == PBT_APMRESUMEAUTOMATIC || wparam.0 == PBT_APMRESUMESUSPEND {
+                let _ = SetTimer(hwnd, TIMER_DEVICE_DEBOUNCE, 2500, None);
+            }
+            LRESULT(0)
+        }
         WM_POLL_DONE => {
             APP.with(|cell| {
-                if let Some(state) = cell.borrow_mut().as_mut() {
-                    state.polling = false;
-                    if let Some(rx) = state.poll_rx.take() {
-                        if let Ok(readings) = rx.try_recv() {
-                            let merged =
-                                merge_with_grace(&state.devices, readings, &mut state.missed_polls);
-                            if state.cfg.seed_selection_if_needed(&merged) {
-                                let _ = state.cfg.save();
+                if let Ok(mut guard) = cell.try_borrow_mut() {
+                    if let Some(state) = guard.as_mut() {
+                        state.polling = false;
+                        if let Some(rx) = state.poll_rx.take() {
+                            if let Ok(readings) = rx.try_recv() {
+                                let merged = merge_with_grace(
+                                    &state.devices,
+                                    readings,
+                                    &mut state.missed_polls,
+                                );
+                                if state.cfg.seed_selection_if_needed(&merged) {
+                                    let _ = state.cfg.save();
+                                }
+                                state.devices = merged;
+                                apply_ui_refresh(state);
                             }
-                            state.devices = merged;
-                            apply_ui_refresh(state);
                         }
                     }
                 }
@@ -491,31 +658,21 @@ unsafe extern "system" fn main_wnd_proc(
         WM_TRAY_CALLBACK => {
             let ev = lparam.0 as u32;
             if ev == WM_RBUTTONUP || ev == WM_LBUTTONUP {
-                APP.with(|cell| {
-                    if let Some(state) = cell.borrow().as_ref() {
-                        state
-                            .tray
-                            .show_context_menu(&state.cfg, &state.devices, startup::is_enabled());
-                    }
-                });
+                open_menu_safely();
             }
             LRESULT(0)
         }
         WM_WIDGET_CLICK | WM_ACTIVATE_EXISTING => {
-            APP.with(|cell| {
-                if let Some(state) = cell.borrow().as_ref() {
-                    state
-                        .tray
-                        .show_context_menu(&state.cfg, &state.devices, startup::is_enabled());
-                }
-            });
+            open_menu_safely();
             LRESULT(0)
         }
         WM_WIDGET_HOVER => {
             let hovered = wparam.0 != 0;
             APP.with(|cell| {
-                if let Some(state) = cell.borrow_mut().as_mut() {
-                    state.widget.set_hovered(hovered);
+                if let Ok(mut guard) = cell.try_borrow_mut() {
+                    if let Some(state) = guard.as_mut() {
+                        state.widget.set_hovered(hovered);
+                    }
                 }
             });
             LRESULT(0)
@@ -523,8 +680,10 @@ unsafe extern "system" fn main_wnd_proc(
         WM_SETTINGCHANGE => {
             let light = startup::is_taskbar_light_theme();
             APP.with(|cell| {
-                if let Some(state) = cell.borrow_mut().as_mut() {
-                    state.widget.set_light_theme(light);
+                if let Ok(mut guard) = cell.try_borrow_mut() {
+                    if let Some(state) = guard.as_mut() {
+                        state.widget.set_light_theme(light);
+                    }
                 }
             });
             LRESULT(0)
@@ -563,13 +722,11 @@ mod tests {
         let mut misses = HashMap::new();
         let mut cur = vec![mk("mouse", 18)];
 
-        // Held across GRACE_MISS_LIMIT transient empty polls without flickering away
         for _ in 0..GRACE_MISS_LIMIT {
             cur = merge_with_grace(&cur, vec![], &mut misses);
             assert_eq!(cur.len(), 1);
             assert!(cur[0].stale);
         }
-        // Dropped cleanly on the (GRACE_MISS_LIMIT + 1)th consecutive miss
         cur = merge_with_grace(&cur, vec![], &mut misses);
         assert!(cur.is_empty());
     }

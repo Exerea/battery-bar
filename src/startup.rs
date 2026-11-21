@@ -72,7 +72,20 @@ pub fn set_enabled(enable: bool) -> Result<(), String> {
     }
 }
 
-/// Detect whether the Windows taskbar uses light theme (AppsUseLightTheme / SystemUsesLightTheme).
+/// If autostart is already enabled, keep its registered path synchronized with the current exe
+/// so moving battery-bar.exe to a new folder does not silently break Windows startup.
+pub fn sync_path_if_enabled() {
+    if is_enabled() {
+        let _ = set_enabled(true);
+    }
+}
+
+/// Remove the HKCU Run startup value cleanly without failing if it was never set.
+pub fn remove_startup_entry() {
+    let _ = set_enabled(false);
+}
+
+/// Detect whether the Windows taskbar uses light theme (SystemUsesLightTheme).
 pub fn is_taskbar_light_theme() -> bool {
     unsafe {
         let subkey = to_wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");

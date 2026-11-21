@@ -102,7 +102,10 @@ impl HidDevice {
                         if w == WAIT_OBJECT_0 {
                             GetOverlappedResult(self.handle, &ov, &mut written, false).is_ok()
                         } else {
-                            let _ = CancelIoEx(self.handle, Some(&ov));
+                            // Wait for cancellation to complete before stack-allocated OVERLAPPED/buf unwind.
+                            if CancelIoEx(self.handle, Some(&ov)).is_ok() {
+                                let _ = GetOverlappedResult(self.handle, &ov, &mut written, true);
+                            }
                             false
                         }
                     } else {
@@ -132,7 +135,10 @@ impl HidDevice {
                         if w == WAIT_OBJECT_0 {
                             GetOverlappedResult(self.handle, &ov, &mut got, false).is_ok()
                         } else {
-                            let _ = CancelIoEx(self.handle, Some(&ov));
+                            // Wait for cancellation to complete before stack-allocated OVERLAPPED/buf unwind.
+                            if CancelIoEx(self.handle, Some(&ov)).is_ok() {
+                                let _ = GetOverlappedResult(self.handle, &ov, &mut got, true);
+                            }
                             false
                         }
                     } else {

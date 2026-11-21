@@ -7,6 +7,7 @@ use serde_json::Value;
 use crate::model::{DeviceKind, DeviceReading};
 
 const MAX_CARD_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_JSON_DEPTH: usize = 32;
 const STALE_THRESHOLD: Duration = Duration::from_secs(3 * 60 * 60);
 
 /// Read phone battery from Windows Phone Link's local Start Menu Adaptive Card (read-only, offline).
@@ -42,7 +43,7 @@ pub fn poll() -> Vec<DeviceReading> {
     };
 
     let mut parsed = ParsedCard::default();
-    walk_json(&root, &mut parsed);
+    walk_json(&root, 0, &mut parsed);
 
     if parsed.percent.is_none() {
         return Vec::new();
@@ -51,7 +52,7 @@ pub fn poll() -> Vec<DeviceReading> {
     let name = parsed
         .device_name
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "Phone (Phone Link)".to_string());
+        .unwrap_or_else(|| "スマホ（スマートフォン連携）".to_string());
 
     vec![DeviceReading {
         key: "phonelink:phone".to_string(),
@@ -73,20 +74,23 @@ struct ParsedCard {
     explicitly_disconnected: bool,
 }
 
-fn walk_json(v: &Value, out: &mut ParsedCard) {
+fn walk_json(v: &Value, depth: usize, out: &mut ParsedCard) {
+    if depth >= MAX_JSON_DEPTH {
+        return;
+    }
     match v {
         Value::Object(map) => {
             for (k, val) in map {
                 if let Value::String(s) = val {
                     inspect_field(k, s, out);
                 } else {
-                    walk_json(val, out);
+                    walk_json(val, depth + 1, out);
                 }
             }
         }
         Value::Array(arr) => {
             for item in arr {
-                walk_json(item, out);
+                walk_json(item, depth + 1, out);
             }
         }
         _ => {}
@@ -99,7 +103,6 @@ fn inspect_field(key: &str, text: &str, out: &mut ParsedCard) {
         return;
     }
 
-    // Battery tooltip/altText in Japanese ("バッテリー残量 63%%" / "充電中") or English ("Battery 63%").
     if matches!(key, "tooltip" | "altText" | "ariaLabel" | "text") {
         let lower = trimmed.to_ascii_lowercase();
         let mentions_battery = lower.contains("battery")
@@ -142,7 +145,6 @@ fn extract_percent(s: &str) -> Option<u8> {
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 i += 1;
             }
-            // Skip optional spaces before '%'
             let mut j = i;
             while j < bytes.len() && bytes[j] == b' ' {
                 j += 1;
@@ -159,4 +161,31 @@ fn extract_percent(s: &str) -> Option<u8> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_japanese_and_english_cards() {
+        let jp: Value = serde_json::json!({
+            "tooltip": "バッテリー残量 24%%",
+            "title": "iPhone"
+        });
+        let mut p = ParsedCard::default();
+        walk_json(&jp, 0, &mut p);
+        assert_eq!(p.percent, Some(24));
+        assert!(!p.charging);
+
+        let en: Value = serde_json::json!({
+            "altText": "Battery 82%, charging",
+            "text": "Pixel 9"
+        });
+        let mut p2 = ParsedCard::default();
+        walk_json(&en, 0, &mut p2);
+        assert_eq!(p2.percent, Some(82));
+        assert!(p2.charging);
+        assert_eq!(p2.device_name.as_deref(), Some("Pixel 9"));
+    }
 }

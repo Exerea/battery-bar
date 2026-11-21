@@ -193,6 +193,15 @@ impl TaskbarWidget {
         self.paint_and_place();
     }
 
+    /// Force recreation and repaint after Explorer restarts (TaskbarCreated).
+    pub fn recreate_and_reposition(&mut self) {
+        self.visible = false;
+        self.last_pos = None;
+        if self.create_window() {
+            self.paint_and_place();
+        }
+    }
+
     pub fn ensure_alive_and_reposition(&mut self) {
         unsafe {
             if self.hwnd.0.is_null() || !IsWindow(self.hwnd).as_bool() {
@@ -295,7 +304,8 @@ impl TaskbarWidget {
                 cbSize: std::mem::size_of::<MONITORINFO>() as u32,
                 ..Default::default()
             };
-            if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            let mon_ok = GetMonitorInfoW(mon, &mut mi).as_bool();
+            if mon_ok {
                 let mr = mi.rcMonitor;
                 // Auto-hidden taskbar sits off-edge
                 if bar.top >= mr.bottom - 4 || bar.bottom <= mr.top + 4 {
@@ -338,8 +348,25 @@ impl TaskbarWidget {
 
             let dpi = self.dpi(tb);
             let margin = self.scale(8, dpi);
-            let x = (anchor_left - self.width - margin).max(bar.left + self.scale(4, dpi));
-            let y = bar.top + (bar_h - self.height) / 2;
+            let is_horizontal = bar_w >= bar_h;
+            let (x, y) = if is_horizontal {
+                let x = (anchor_left - self.width - margin).max(bar.left + self.scale(4, dpi));
+                let y = bar.top + (bar_h - self.height) / 2;
+                (x, y)
+            } else {
+                // Vertical taskbar fallback: anchor safely above the tray area inside monitor bounds.
+                let raw_x = bar.left + (bar_w - self.width) / 2;
+                let x = if mon_ok {
+                    raw_x.clamp(
+                        mi.rcMonitor.left + 4,
+                        (mi.rcMonitor.right - self.width - 4).max(mi.rcMonitor.left + 4),
+                    )
+                } else {
+                    raw_x
+                };
+                let y = (tr.top - self.height - margin).max(bar.top + self.scale(4, dpi));
+                (x, y)
+            };
             Some((x, y, bar_h))
         }
     }
