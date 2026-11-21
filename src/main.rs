@@ -51,11 +51,15 @@ const WM_ACTIVATE_EXISTING: u32 = WM_APP + 5;
 
 const TIMER_POLL: usize = 1;
 const TIMER_REPOSITION: usize = 2;
+const GRACE_MISS_LIMIT: u8 = 3;
 
 struct AppState {
     hwnd: HWND,
     cfg: AppConfig,
     devices: Vec<DeviceReading>,
+    /// Tracks consecutive missed polls per device key so brief wireless sleep or HID contention
+    /// does not make an item flicker out and back on the taskbar.
+    missed_polls: HashMap<String, u8>,
     widget: TaskbarWidget,
     tray: TrayIcon,
     poll_rx: Option<Receiver<Vec<DeviceReading>>>,
@@ -137,6 +141,7 @@ fn main() {
                 hwnd,
                 cfg,
                 devices: Vec::new(),
+                missed_polls: HashMap::new(),
                 widget,
                 tray,
                 poll_rx: None,
@@ -147,7 +152,7 @@ fn main() {
 
         trigger_async_poll();
         let _ = SetTimer(hwnd, TIMER_POLL, poll_ms, None);
-        let _ = SetTimer(hwnd, TIMER_REPOSITION, 1000, None);
+        let _ = SetTimer(hwnd, TIMER_REPOSITION, 250, None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -408,6 +413,41 @@ fn handle_command(cmd_id: usize) {
     }
 }
 
+/// Merge fresh poll results with previous readings, holding transient misses for up to
+/// GRACE_MISS_LIMIT polls so brief mouse/headset sleep does not cause taskbar flicker.
+fn merge_with_grace(
+    previous: &[DeviceReading],
+    fresh: Vec<DeviceReading>,
+    missed_polls: &mut HashMap<String, u8>,
+) -> Vec<DeviceReading> {
+    let mut merged: HashMap<String, DeviceReading> = HashMap::new();
+    for item in fresh {
+        missed_polls.remove(&item.key);
+        merged.insert(item.key.clone(), item);
+    }
+    for prev in previous {
+        if merged.contains_key(&prev.key) {
+            continue;
+        }
+        let misses = missed_polls.entry(prev.key.clone()).or_insert(0);
+        *misses = misses.saturating_add(1);
+        if *misses <= GRACE_MISS_LIMIT {
+            let mut held = prev.clone();
+            held.stale = true;
+            merged.insert(held.key.clone(), held);
+        } else {
+            missed_polls.remove(&prev.key);
+        }
+    }
+    let mut out: Vec<DeviceReading> = merged.into_values().collect();
+    out.sort_by(|a, b| {
+        b.connected
+            .cmp(&a.connected)
+            .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+    });
+    out
+}
+
 unsafe extern "system" fn main_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -435,10 +475,12 @@ unsafe extern "system" fn main_wnd_proc(
                     state.polling = false;
                     if let Some(rx) = state.poll_rx.take() {
                         if let Ok(readings) = rx.try_recv() {
-                            if state.cfg.seed_selection_if_needed(&readings) {
+                            let merged =
+                                merge_with_grace(&state.devices, readings, &mut state.missed_polls);
+                            if state.cfg.seed_selection_if_needed(&merged) {
                                 let _ = state.cfg.save();
                             }
-                            state.devices = readings;
+                            state.devices = merged;
                             apply_ui_refresh(state);
                         }
                     }
@@ -496,5 +538,39 @@ unsafe extern "system" fn main_wnd_proc(
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk(key: &str, pct: u8) -> DeviceReading {
+        DeviceReading {
+            key: key.to_string(),
+            name: key.to_string(),
+            kind: DeviceKind::Mouse,
+            source: "test".to_string(),
+            percent: Some(pct),
+            charging: false,
+            connected: true,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn grace_cache_holds_transient_misses_then_drops() {
+        let mut misses = HashMap::new();
+        let mut cur = vec![mk("mouse", 18)];
+
+        // Held across GRACE_MISS_LIMIT transient empty polls without flickering away
+        for _ in 0..GRACE_MISS_LIMIT {
+            cur = merge_with_grace(&cur, vec![], &mut misses);
+            assert_eq!(cur.len(), 1);
+            assert!(cur[0].stale);
+        }
+        // Dropped cleanly on the (GRACE_MISS_LIMIT + 1)th consecutive miss
+        cur = merge_with_grace(&cur, vec![], &mut misses);
+        assert!(cur.is_empty());
     }
 }

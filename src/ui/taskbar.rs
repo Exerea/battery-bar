@@ -14,12 +14,12 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, FindWindowW,
-    GetForegroundWindow, GetWindowRect, IsWindow, IsWindowVisible, LoadCursorW, PostMessageW,
-    RegisterClassW, SetWindowPos, ShowWindow, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW,
-    HWND_TOPMOST, IDC_HAND, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, FindWindowW, GetClassNameW,
+    GetForegroundWindow, GetWindow, GetWindowRect, IsWindow, IsWindowVisible, LoadCursorW,
+    PostMessageW, RegisterClassW, SetWindowPos, ShowWindow, UpdateLayeredWindow, CS_HREDRAW,
+    CS_VREDRAW, GW_HWNDPREV, HWND_TOPMOST, IDC_HAND, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONUP, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::model::DeviceKind;
@@ -28,7 +28,7 @@ const WIDGET_CLASS: &str = "BatteryBarTaskbarStrip";
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const GLYPH_CHARGING: &str = "\u{E945}"; // Segoe Fluent Icons LightningBolt
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StripItem {
     pub kind: DeviceKind,
     pub short_label: String,
@@ -45,6 +45,8 @@ pub struct TaskbarWidget {
     height: i32,
     light_theme: bool,
     hovered: bool,
+    visible: bool,
+    last_pos: Option<(i32, i32)>,
     items: Vec<StripItem>,
 }
 
@@ -123,6 +125,8 @@ impl TaskbarWidget {
             height: 32,
             light_theme,
             hovered: false,
+            visible: false,
+            last_pos: None,
             items: Vec::new(),
         };
         w.create_window();
@@ -181,6 +185,10 @@ impl TaskbarWidget {
     }
 
     pub fn set_items(&mut self, items: Vec<StripItem>) {
+        // Avoid redundant DIB reallocation and layered repaints when displayed values are unchanged.
+        if self.items == items && (!items.is_empty() || !self.visible) {
+            return;
+        }
         self.items = items;
         self.paint_and_place();
     }
@@ -188,29 +196,54 @@ impl TaskbarWidget {
     pub fn ensure_alive_and_reposition(&mut self) {
         unsafe {
             if self.hwnd.0.is_null() || !IsWindow(self.hwnd).as_bool() {
+                self.visible = false;
+                self.last_pos = None;
                 if self.create_window() {
                     self.paint_and_place();
                 }
                 return;
             }
             if self.items.is_empty() {
-                let _ = ShowWindow(self.hwnd, SW_HIDE);
+                if self.visible {
+                    let _ = ShowWindow(self.hwnd, SW_HIDE);
+                    self.visible = false;
+                }
                 return;
             }
             if let Some((x, y, _)) = self.compute_taskbar_anchor() {
-                let _ = SetWindowPos(
-                    self.hwnd,
-                    HWND_TOPMOST,
-                    x,
-                    y,
-                    self.width,
-                    self.height,
-                    SWP_NOACTIVATE,
-                );
-                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
-            } else {
-                // Hide cleanly while taskbar is hidden or a fullscreen app covers the monitor.
+                let pos_changed = self.last_pos != Some((x, y));
+                let taskbar_above_us = is_taskbar_above(self.hwnd);
+                if pos_changed {
+                    let _ = SetWindowPos(
+                        self.hwnd,
+                        HWND_TOPMOST,
+                        x,
+                        y,
+                        self.width,
+                        self.height,
+                        SWP_NOACTIVATE,
+                    );
+                    self.last_pos = Some((x, y));
+                } else if taskbar_above_us {
+                    // Clicking the taskbar raises Shell_TrayWnd to top of the topmost band;
+                    // re-raise our strip promptly without reallocating or moving.
+                    let _ = SetWindowPos(
+                        self.hwnd,
+                        HWND_TOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                    );
+                }
+                if !self.visible {
+                    let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                    self.visible = true;
+                }
+            } else if self.visible {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
+                self.visible = false;
             }
         }
     }
@@ -269,7 +302,12 @@ impl TaskbarWidget {
                     return None;
                 }
                 let fg = GetForegroundWindow();
-                if !fg.0.is_null() && fg != tb && fg != self.hwnd && IsWindowVisible(fg).as_bool() {
+                if !fg.0.is_null()
+                    && fg != tb
+                    && fg != self.hwnd
+                    && IsWindowVisible(fg).as_bool()
+                    && !is_desktop_or_shell_window(fg)
+                {
                     let mut fr = RECT::default();
                     if GetWindowRect(fg, &mut fr).is_ok()
                         && fr.left <= mr.left
@@ -314,7 +352,10 @@ impl TaskbarWidget {
                 }
             }
             if self.items.is_empty() {
-                let _ = ShowWindow(self.hwnd, SW_HIDE);
+                if self.visible {
+                    let _ = ShowWindow(self.hwnd, SW_HIDE);
+                    self.visible = false;
+                }
                 return;
             }
 
@@ -549,6 +590,7 @@ impl TaskbarWidget {
                 let _ = DeleteObject(label_font);
                 let _ = DeleteObject(pct_font);
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
+                self.visible = false;
                 return;
             };
 
@@ -583,7 +625,11 @@ impl TaskbarWidget {
                 h,
                 SWP_NOACTIVATE,
             );
-            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            self.last_pos = Some((dst_x, dst_y));
+            if !self.visible {
+                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                self.visible = true;
+            }
 
             let _ = DeleteObject(bmp);
             let _ = DeleteDC(mem_dc);
@@ -599,6 +645,47 @@ impl Drop for TaskbarWidget {
     fn drop(&mut self) {
         self.destroy();
     }
+}
+
+/// Exclude desktop background and Windows shell chrome from fullscreen occlusion detection
+/// so clicking the desktop or tray overflow never hides the battery strip.
+unsafe fn is_desktop_or_shell_window(hwnd: HWND) -> bool {
+    let mut buf = [0u16; 64];
+    let len = GetClassNameW(hwnd, &mut buf) as usize;
+    if len == 0 {
+        return false;
+    }
+    let cls = String::from_utf16_lossy(&buf[..len]);
+    matches!(
+        cls.as_str(),
+        "Progman"
+            | "WorkerW"
+            | "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "NotifyIconOverflowWindow"
+            | "TopLevelWindowForOverflowXamlIsland"
+    )
+}
+
+/// Return true if Shell_TrayWnd currently sits higher in Z-order than `hwnd`.
+unsafe fn is_taskbar_above(hwnd: HWND) -> bool {
+    let tb_cls = to_wide("Shell_TrayWnd");
+    let Ok(tb) = FindWindowW(PCWSTR(tb_cls.as_ptr()), PCWSTR::null()) else {
+        return false;
+    };
+    if tb.0.is_null() {
+        return false;
+    }
+    let mut cur = GetWindow(hwnd, GW_HWNDPREV).unwrap_or_default();
+    let mut steps = 0;
+    while !cur.0.is_null() && steps < 32 {
+        if cur == tb {
+            return true;
+        }
+        cur = GetWindow(cur, GW_HWNDPREV).unwrap_or_default();
+        steps += 1;
+    }
+    false
 }
 
 fn accent_color(item: &StripItem, light_theme: bool) -> (u8, u8, u8) {

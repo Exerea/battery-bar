@@ -47,6 +47,8 @@ pub struct TrayIcon {
     callback_msg: u32,
     icon: HICON,
     added: bool,
+    last_tooltip: String,
+    last_alert: Option<bool>,
 }
 
 impl TrayIcon {
@@ -57,12 +59,17 @@ impl TrayIcon {
             callback_msg,
             icon,
             added: false,
+            last_tooltip: String::new(),
+            last_alert: None,
         };
         t.add_or_update("BatteryBar", false);
         t
     }
 
     pub fn add_or_update(&mut self, tooltip: &str, any_low: bool) {
+        if self.added && self.last_tooltip == tooltip && self.last_alert == Some(any_low) {
+            return;
+        }
         unsafe {
             let new_icon = create_battery_icon(any_low);
             let mut nid = NOTIFYICONDATAW {
@@ -80,6 +87,8 @@ impl TrayIcon {
             let cmd = if self.added { NIM_MODIFY } else { NIM_ADD };
             if Shell_NotifyIconW(cmd, &nid).as_bool() {
                 self.added = true;
+                self.last_tooltip = tooltip.to_string();
+                self.last_alert = Some(any_low);
             }
             if !self.icon.0.is_null() {
                 let _ = DestroyIcon(self.icon);
