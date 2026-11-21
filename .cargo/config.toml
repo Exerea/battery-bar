@@ -1,0 +1,6 @@
+[target.'cfg(target_env = "msvc")']
+# Avoid embedding local PDB absolute paths and build timestamps in distributed binaries.
+rustflags = [
+    "-C", "link-arg=/PDBALTPATH:none",
+    "-C", "link-arg=/BREPRO",
+]
